@@ -1,0 +1,840 @@
+// ============================================================
+// EMI Scanner + Resonance Massager v2
+// ESP32-C3 Super Mini
+// Таймер НЕ запускается при старте — только WiFi
+// ============================================================
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <math.h>
+
+// ─────────── ВЕРСИЯ CORE ───────────
+#ifdef ESP_ARDUINO_VERSION_MAJOR
+  #if ESP_ARDUINO_VERSION_MAJOR >= 3
+    #define CORE3
+  #endif
+#endif
+
+// ─────────── ПИНЫ (ESP32-C3) ───────────
+#define PWM_PIN        5
+#define ADC_SENSE_PIN  0
+#define ADC_PIEZO_PIN  1
+
+// ─────────── КОНСТАНТЫ ───────────
+#define PWM_RESOLUTION      10
+#define PWM_MAX             ((1 << PWM_RESOLUTION) - 1)
+#define PWM_CARRIER_FREQ    40000
+#define SINE_TABLE_SIZE     256
+#define R_SENSE             4700.0f
+#define ADC_SAMPLES_PER_PERIOD  20
+#define ADC_PERIODS_TO_AVERAGE  30
+#define SETTLE_TIME_MS          30
+#define SYNTH_SAMPLE_RATE       20000
+
+// ─────────── ТИПЫ ───────────
+
+enum Mode {
+    MODE_IDLE,
+    MODE_SCANNING,
+    MODE_GENERATING,
+    MODE_ADAPTIVE,
+    MODE_SELF_SCAN,
+    MODE_MODULATED
+};
+
+struct ImpedanceMeasurement {
+    float magnitude;
+    float phase;
+    float vSenseRMS;
+    float vPiezoRMS;
+};
+
+struct ScanResult {
+    float freq[800];
+    float impedance[800];
+    float phase[800];
+    int   count;
+    float peakFreq;
+    float peakZ;
+};
+
+struct AdaptiveState {
+    float currentFreq;
+    float scanWindow;
+    float adaptStep;
+    unsigned long lastScanMs;
+    unsigned long scanIntervalMs;
+};
+
+struct GenParams {
+    float targetFreq;
+    float carrierFreq;
+    bool  useModulation;
+    float modulationDepth;
+};
+
+// ─────────── WiFi ───────────
+const char* AP_SSID = "EMI-Scanner";
+const char* AP_PASS = "";
+const IPAddress AP_IP(192, 168, 4, 1);
+const IPAddress AP_GW(192, 168, 4, 1);
+const IPAddress AP_MASK(255, 255, 255, 0);
+
+// ─────────── ГЛОБАЛЬНЫЕ ОБЪЕКТЫ ───────────
+WebServer server(80);
+DNSServer dnsServer;
+hw_timer_t* synthTimer = NULL;
+bool timerInitialized = false;
+
+// ─────────── СОСТОЯНИЕ ───────────
+uint16_t sineTable[SINE_TABLE_SIZE];
+volatile Mode currentMode = MODE_IDLE;
+
+ScanResult    scanResult;
+ScanResult    selfScanResult;
+AdaptiveState adaptiveState;
+GenParams     genParams;
+
+// ─────────── СИНТЕЗАТОР (целочисленный) ───────────
+volatile uint32_t phaseAccumulator = 0;
+volatile uint32_t phaseIncrement = 0;
+volatile bool     synthActive = false;
+volatile uint32_t modPhaseAcc = 0;
+volatile uint32_t modPhaseInc = 0;
+volatile bool     modEnabled = false;
+volatile uint16_t modDepthFixed = 1024;
+
+// ═══════════════════════════════════════
+// ФУНКЦИИ
+// ═══════════════════════════════════════
+
+// ─────────── ISR — без float! ───────────
+
+void IRAM_ATTR onSynthTimer() {
+    if (!synthActive) return;
+
+    phaseAccumulator += phaseIncrement;
+    uint8_t idx = phaseAccumulator >> 24;
+    uint32_t duty = sineTable[idx];
+
+    if (modEnabled) {
+        modPhaseAcc += modPhaseInc;
+        uint8_t modIdx = modPhaseAcc >> 24;
+        uint32_t env = (uint32_t)(1024 - modDepthFixed)
+            + ((uint32_t)modDepthFixed * sineTable[modIdx]) / PWM_MAX;
+        duty = (duty * env) >> 10;
+    }
+
+    #ifdef CORE3
+    ledcWrite(PWM_PIN, duty);
+    #else
+    ledcWrite(0, duty);
+    #endif
+}
+
+// ─────────── ИНИЦИАЛИЗАЦИЯ ТАБЛИЦЫ ───────────
+
+void initSineTable() {
+    for (int i = 0; i < SINE_TABLE_SIZE; i++) {
+        float val = sinf(2.0f * M_PI * i / SINE_TABLE_SIZE);
+        sineTable[i] = (uint16_t)((val * 0.45f + 0.5f) * PWM_MAX);
+    }
+}
+
+// ─────────── ЛЕНИВАЯ ИНИЦИАЛИЗАЦИЯ ТАЙМЕРА ───────────
+
+void ensureTimerInitialized() {
+    if (timerInitialized) return;
+
+    #ifdef CORE3
+    ledcAttach(PWM_PIN, PWM_CARRIER_FREQ, PWM_RESOLUTION);
+    ledcWrite(PWM_PIN, PWM_MAX / 2);
+    #else
+    ledcSetup(0, PWM_CARRIER_FREQ, PWM_RESOLUTION);
+    ledcAttachPin(PWM_PIN, 0);
+    ledcWrite(0, PWM_MAX / 2);
+    #endif
+
+    #ifdef CORE3
+    synthTimer = timerBegin(SYNTH_SAMPLE_RATE);
+    timerAttachInterrupt(synthTimer, &onSynthTimer);
+    timerAlarm(synthTimer, 1, true, 0);
+    #else
+    synthTimer = timerBegin(0, 80, true);
+    timerAttachInterrupt(synthTimer, &onSynthTimer, true);
+    timerAlarmWrite(synthTimer, 1000000 / SYNTH_SAMPLE_RATE, true);
+    timerAlarmEnable(synthTimer);
+    #endif
+
+    timerInitialized = true;
+    Serial.println("Timer initialized on demand");
+}
+
+// ─────────── УПРАВЛЕНИЕ СИНТЕЗАТОРОМ ───────────
+
+void startSynth(float freqHz) {
+    ensureTimerInitialized();
+    phaseIncrement = (uint32_t)((double)(1ULL << 32)
+        * (double)freqHz / (double)SYNTH_SAMPLE_RATE);
+    phaseAccumulator = 0;
+    modEnabled = false;
+    synthActive = true;
+}
+
+void startModulatedSynth(float carrierHz, float modulationHz,
+                         float depth) {
+    ensureTimerInitialized();
+    phaseIncrement = (uint32_t)((double)(1ULL << 32)
+        * (double)carrierHz / (double)SYNTH_SAMPLE_RATE);
+    modPhaseInc = (uint32_t)((double)(1ULL << 32)
+        * (double)modulationHz / (double)SYNTH_SAMPLE_RATE);
+    modDepthFixed = (uint16_t)(depth * 1024.0f);
+    if (modDepthFixed > 1024) modDepthFixed = 1024;
+    phaseAccumulator = 0;
+    modPhaseAcc = 0;
+    modEnabled = true;
+    synthActive = true;
+}
+
+void stopSynth() {
+    synthActive = false;
+    modEnabled = false;
+    if (timerInitialized) {
+        #ifdef CORE3
+        ledcWrite(PWM_PIN, PWM_MAX / 2);
+        #else
+        ledcWrite(0, PWM_MAX / 2);
+        #endif
+    }
+}
+
+// ─────────── ИЗМЕРЕНИЕ ИМПЕДАНСА ───────────
+
+ImpedanceMeasurement measureImpedanceAt(float freqHz) {
+    ImpedanceMeasurement result;
+    result.magnitude = 0;
+    result.phase = 0;
+    result.vSenseRMS = 0;
+    result.vPiezoRMS = 0;
+
+    startSynth(freqHz);
+    delay(SETTLE_TIME_MS);
+
+    float periodUs = 1000000.0f / freqHz;
+    int totalSamples = ADC_SAMPLES_PER_PERIOD * ADC_PERIODS_TO_AVERAGE;
+    float sampleIntervalUs = (periodUs * ADC_PERIODS_TO_AVERAGE)
+                             / totalSamples;
+
+    // Сначала определяем DC-смещение (среднее)
+    long dcSense = 0, dcPiezo = 0;
+    for (int i = 0; i < 50; i++) {
+        dcSense += analogRead(ADC_SENSE_PIN);
+        dcPiezo += analogRead(ADC_PIEZO_PIN);
+        delayMicroseconds(100);
+    }
+    float dcSenseV = (dcSense / 50.0f / 4095.0f) * 3.3f;
+    float dcPiezoV = (dcPiezo / 50.0f / 4095.0f) * 3.3f;
+
+    float sumSenseSq = 0, sumPiezoSq = 0;
+    float sumSenseI = 0, sumSenseQ = 0;
+    float sumPiezoI = 0, sumPiezoQ = 0;
+
+    unsigned long startUs = micros();
+
+    for (int i = 0; i < totalSamples; i++) {
+        unsigned long targetUs = startUs
+            + (unsigned long)(i * sampleIntervalUs);
+        while (micros() < targetUs) {}
+
+        float vSense = (analogRead(ADC_SENSE_PIN) / 4095.0f)
+                       * 3.3f - dcSenseV;
+        float vPiezo = (analogRead(ADC_PIEZO_PIN) / 4095.0f)
+                       * 3.3f - dcPiezoV;
+
+        sumSenseSq += vSense * vSense;
+        sumPiezoSq += vPiezo * vPiezo;
+
+        float angle = 2.0f * M_PI * i / ADC_SAMPLES_PER_PERIOD;
+        float cosA = cosf(angle);
+        float sinA = sinf(angle);
+
+        sumSenseI += vSense * cosA;
+        sumSenseQ += vSense * sinA;
+        sumPiezoI += vPiezo * cosA;
+        sumPiezoQ += vPiezo * sinA;
+    }
+
+    result.vSenseRMS = sqrtf(sumSenseSq / totalSamples);
+    result.vPiezoRMS = sqrtf(sumPiezoSq / totalSamples);
+
+    if (result.vSenseRMS > 0.001f) {
+        result.magnitude = result.vPiezoRMS * R_SENSE
+                           / result.vSenseRMS;
+    } else {
+        result.magnitude = 999999.0f;
+    }
+
+    float phaseSense = atan2f(sumSenseQ, sumSenseI);
+    float phasePiezo = atan2f(sumPiezoQ, sumPiezoI);
+    result.phase = (phasePiezo - phaseSense) * 180.0f / M_PI;
+    if (result.phase > 180.0f) result.phase -= 360.0f;
+    if (result.phase < -180.0f) result.phase += 360.0f;
+
+    return result;
+}
+
+// ─────────── СКАНИРОВАНИЕ ───────────
+
+void performScan(ScanResult& res, float fStart, float fStop,
+                 float fStep) {
+    res.count = 0;
+    res.peakZ = 0;
+    res.peakFreq = 0;
+
+    for (float f = fStart; f <= fStop && res.count < 800;
+         f += fStep) {
+        ImpedanceMeasurement m = measureImpedanceAt(f);
+
+        res.freq[res.count] = f;
+        res.impedance[res.count] = m.magnitude;
+        res.phase[res.count] = m.phase;
+
+        if (m.magnitude > res.peakZ && m.magnitude < 500000.0f) {
+            res.peakZ = m.magnitude;
+            res.peakFreq = f;
+        }
+
+        res.count++;
+        Serial.printf("%.1f Hz Z=%.1f ph=%.1f\n",
+                       f, m.magnitude, m.phase);
+
+        // Даём WiFi-стеку немного времени
+        yield();
+    }
+
+    stopSynth();
+    Serial.printf("Peak: %.1f Hz Z=%.1f\n",
+                   res.peakFreq, res.peakZ);
+}
+
+float adaptiveMiniScan(float centerFreq, float window,
+                       float step) {
+    float bestFreq = centerFreq;
+    float bestZ = 0;
+    float fStart = centerFreq - window;
+    if (fStart < 20.0f) fStart = 20.0f;
+    float fStop = centerFreq + window;
+
+    for (float f = fStart; f <= fStop; f += step) {
+        ImpedanceMeasurement m = measureImpedanceAt(f);
+        if (m.magnitude > bestZ && m.magnitude < 500000.0f) {
+            bestZ = m.magnitude;
+            bestFreq = f;
+        }
+        yield();
+    }
+    return bestFreq;
+}
+
+// ═══════════════════════════════════════
+// ВЕБ-СТРАНИЦА
+// ═══════════════════════════════════════
+
+const char HTML_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>EMI Scanner</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,Arial,sans-serif;background:#1a1a2e;
+color:#eee;padding:10px;max-width:600px;margin:0 auto}
+.card{background:#16213e;border-radius:12px;padding:15px;
+margin:10px 0;box-shadow:0 4px 15px rgba(0,0,0,.3)}
+h1{text-align:center;color:#0ff;font-size:1.4em;margin-bottom:15px}
+h2{color:#0af;font-size:1.1em;margin-bottom:10px;
+border-bottom:1px solid rgba(0,170,255,.2);padding-bottom:5px}
+label{display:block;margin:8px 0 3px;font-size:.85em;color:#aaa}
+input[type=number]{width:100%;padding:8px;background:#0a0e27;
+border:1px solid rgba(0,170,255,.2);color:#eee;
+border-radius:6px;font-size:1em}
+.row{display:flex;gap:10px}
+.row>div{flex:1}
+button{width:100%;padding:12px;margin:5px 0;border:none;
+border-radius:8px;font-size:1em;font-weight:bold;cursor:pointer}
+button:active{transform:scale(.97)}
+.btn-scan{background:#0af;color:#000}
+.btn-gen{background:#0fa;color:#000}
+.btn-adapt{background:#fa0;color:#000}
+.btn-stop{background:#f44;color:#fff}
+.btn-self{background:#a0f;color:#fff}
+.status{text-align:center;padding:10px;font-size:1.1em;
+color:#0ff;min-height:40px}
+.result{text-align:center;font-size:1.5em;color:#0fa;padding:10px}
+canvas{width:100%;height:250px;background:#0a0e27;
+border-radius:8px;border:1px solid rgba(0,170,255,.2)}
+.chk{display:flex;align-items:center;gap:8px;margin:8px 0}
+.chk input{width:auto}
+.harm{display:flex;gap:5px;margin:8px 0}
+.harm button{flex:1;padding:8px;font-size:.85em;
+background:#234;color:#0af;border:1px solid #0af;border-radius:6px}
+.harm button.active{background:#0af;color:#000}
+.info{font-size:.75em;color:#668;margin-top:5px}
+</style>
+</head>
+<body>
+<h1>EMI Resonance Scanner</h1>
+
+<div class="card">
+<div class="status" id="st">Ready — connect piezo and press Scan</div>
+<div class="result" id="res"></div>
+</div>
+
+<div class="card">
+<h2>Impedance Spectrum</h2>
+<canvas id="chart"></canvas>
+</div>
+
+<div class="card">
+<h2>Body / Object Scan</h2>
+<div class="row">
+<div><label>Start Hz</label>
+<input type="number" id="fS" value="50"></div>
+<div><label>Stop Hz</label>
+<input type="number" id="fE" value="1000"></div>
+<div><label>Step Hz</label>
+<input type="number" id="fT" value="5"></div>
+</div>
+<button class="btn-scan" onclick="doScan()">Scan Resonance</button>
+<div class="info">Place piezo on skin with gel. Takes ~30-60 sec.</div>
+</div>
+
+<div class="card">
+<h2>Piezo Self-Scan</h2>
+<div class="row">
+<div><label>Start Hz</label>
+<input type="number" id="sS" value="1000"></div>
+<div><label>Stop Hz</label>
+<input type="number" id="sE" value="8000"></div>
+<div><label>Step Hz</label>
+<input type="number" id="sT" value="50"></div>
+</div>
+<button class="btn-self" onclick="doSelf()">Scan Piezo</button>
+<div class="info">Hold piezo in air (not touching anything).</div>
+</div>
+
+<div class="card">
+<h2>Generate</h2>
+<label>Frequency Hz</label>
+<input type="number" id="gF" value="0" step="0.1">
+<div class="harm">
+<button id="h1" class="active" onclick="sH(1)">f0</button>
+<button id="h2" onclick="sH(2)">2f0</button>
+<button id="h4" onclick="sH(4)">4f0</button>
+<button id="h8" onclick="sH(8)">8f0</button>
+</div>
+<div class="chk">
+<input type="checkbox" id="uM" onchange="document.getElementById('mS').style.display=this.checked?'block':'none'">
+<label for="uM" style="display:inline;margin:0">
+AM Modulation (piezo carrier)</label>
+</div>
+<div id="mS" style="display:none">
+<label>Carrier Hz</label>
+<input type="number" id="cF" value="4000">
+<label>Depth 0-100%</label>
+<input type="number" id="mD" value="100" min="0" max="100">
+</div>
+<button class="btn-gen" onclick="doGen()">Start</button>
+<button class="btn-adapt" onclick="doAdapt()">Adaptive</button>
+<button class="btn-stop" onclick="doStop()">Stop</button>
+</div>
+
+<div class="card">
+<h2>Adaptive Settings</h2>
+<div class="row">
+<div><label>Window +/-Hz</label>
+<input type="number" id="aW" value="50"></div>
+<div><label>Step Hz</label>
+<input type="number" id="aS" value="2"></div>
+<div><label>Interval s</label>
+<input type="number" id="aI" value="5"></div>
+</div>
+</div>
+
+<script>
+var cv,cx,sd={freq:[],z:[],phase:[]},bf=0,pt=null;
+
+function init(){
+cv=document.getElementById('chart');
+cx=cv.getContext('2d');
+cv.width=cv.offsetWidth*2;cv.height=500;draw()}
+
+function draw(){
+var w=cv.width,h=cv.height;
+cx.fillStyle='#0a0e27';cx.fillRect(0,0,w,h);
+if(sd.freq.length<2){cx.fillStyle='#334';cx.font='24px Arial';
+cx.textAlign='center';cx.fillText('No data',w/2,h/2);return}
+var m={t:30,r:20,b:50,l:60},pw=w-m.l-m.r,ph=h-m.t-m.b;
+var f0=sd.freq[0],f1=sd.freq[sd.freq.length-1];
+var zx=Math.max(...sd.z)*1.1,zn=Math.min(...sd.z)*0.9;
+if(zx-zn<1){zx+=1;zn-=1}
+cx.strokeStyle='#1a2a4a';cx.lineWidth=1;
+for(var i=0;i<=5;i++){var y=m.t+ph*i/5;
+cx.beginPath();cx.moveTo(m.l,y);cx.lineTo(w-m.r,y);cx.stroke()}
+cx.fillStyle='#668';cx.font='20px Arial';cx.textAlign='center';
+for(var i=0;i<=5;i++){var f=f0+(f1-f0)*i/5;
+cx.fillText(f.toFixed(0),m.l+pw*i/5,h-15)}
+cx.textAlign='right';
+for(var i=0;i<=5;i++){var z=zn+(zx-zn)*(1-i/5);
+cx.fillText(z.toFixed(0),m.l-8,m.t+ph*i/5+6)}
+cx.strokeStyle='#0ff';cx.lineWidth=2;cx.beginPath();
+for(var i=0;i<sd.freq.length;i++){
+var x=m.l+pw*(sd.freq[i]-f0)/(f1-f0);
+var y=m.t+ph*(1-(sd.z[i]-zn)/(zx-zn));
+if(i===0)cx.moveTo(x,y);else cx.lineTo(x,y)}
+cx.stroke();
+var pi=sd.z.indexOf(Math.max(...sd.z));
+if(pi>=0){var px=m.l+pw*(sd.freq[pi]-f0)/(f1-f0);
+var py=m.t+ph*(1-(sd.z[pi]-zn)/(zx-zn));
+cx.fillStyle='#f44';cx.beginPath();
+cx.arc(px,py,6,0,Math.PI*2);cx.fill();
+cx.fillStyle='#ff0';cx.font='bold 22px Arial';cx.textAlign='center';
+cx.fillText(sd.freq[pi].toFixed(1)+' Hz',px,py-15)}}
+
+async function gj(u){var r=await fetch(u);return await r.json()}
+
+async function doScan(){
+var a=document.getElementById('fS').value;
+var b=document.getElementById('fE').value;
+var c=document.getElementById('fT').value;
+document.getElementById('st').textContent='Scanning...';
+var d=await gj('/api/scan?start='+a+'&stop='+b+'&step='+c);
+sd=d;bf=d.peakFreq||0;
+document.getElementById('gF').value=bf.toFixed(1);
+document.getElementById('res').textContent='Resonance: '+bf.toFixed(1)+' Hz';
+document.getElementById('st').textContent='Done';draw()}
+
+async function doSelf(){
+var a=document.getElementById('sS').value;
+var b=document.getElementById('sE').value;
+var c=document.getElementById('sT').value;
+document.getElementById('st').textContent='Scanning piezo...';
+var d=await gj('/api/selfscan?start='+a+'&stop='+b+'&step='+c);
+sd=d;document.getElementById('cF').value=(d.peakFreq||4000).toFixed(0);
+document.getElementById('res').textContent='Piezo: '+(d.peakFreq||0).toFixed(1)+' Hz';
+document.getElementById('st').textContent='Done';draw()}
+
+function sH(n){
+document.querySelectorAll('.harm button').forEach(function(b){b.classList.remove('active')});
+document.getElementById('h'+n).classList.add('active');
+if(bf>0)document.getElementById('gF').value=(bf*n).toFixed(1)}
+
+async function doGen(){
+var f=document.getElementById('gF').value;
+var mod=document.getElementById('uM').checked?1:0;
+var c=document.getElementById('cF').value;
+var d=document.getElementById('mD').value/100;
+await gj('/api/generate?freq='+f+'&mod='+mod+'&carrier='+c+'&depth='+d);
+document.getElementById('st').textContent='Gen: '+f+' Hz'+(mod?' (AM '+c+')':'')}
+
+async function doAdapt(){
+var f=document.getElementById('gF').value;
+var w=document.getElementById('aW').value;
+var s=document.getElementById('aS').value;
+var iv=document.getElementById('aI').value;
+var mod=document.getElementById('uM').checked?1:0;
+var c=document.getElementById('cF').value;
+var d=document.getElementById('mD').value/100;
+await gj('/api/adaptive?freq='+f+'&window='+w+'&step='+s
++'&interval='+iv+'&mod='+mod+'&carrier='+c+'&depth='+d);
+document.getElementById('st').textContent='Adaptive: '+f+' Hz';
+if(pt)clearInterval(pt);
+pt=setInterval(async function(){
+var s=await gj('/api/status');
+if(s.mode==='adaptive'){
+document.getElementById('st').textContent='Adaptive: '+s.currentFreq.toFixed(1)+' Hz';
+document.getElementById('gF').value=s.currentFreq.toFixed(1)}},2000)}
+
+async function doStop(){
+await gj('/api/stop');
+document.getElementById('st').textContent='Stopped';
+if(pt){clearInterval(pt);pt=null}}
+
+window.onload=init;
+window.onresize=function(){cv.width=cv.offsetWidth*2;draw()};
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ─────────── CAPTIVE PORTAL ───────────
+
+const char REDIR[] PROGMEM =
+"<html><head><meta http-equiv=\"refresh\" "
+"content=\"0;url=http://192.168.4.1/\"></head>"
+"<body>Redirecting...</body></html>";
+
+// ═══════════════════════════════════════
+// API HANDLERS
+// ═══════════════════════════════════════
+
+void handleRoot() {
+    server.send_P(200, "text/html", HTML_PAGE);
+}
+
+void handleRedirect() {
+    server.send_P(200, "text/html", REDIR);
+}
+
+String buildJSON(ScanResult& r) {
+    String j = "{\"peakFreq\":";
+    j += String(r.peakFreq, 1);
+    j += ",\"peakZ\":";
+    j += String(r.peakZ, 1);
+    j += ",\"freq\":[";
+    for (int i = 0; i < r.count; i++) {
+        if (i) j += ",";
+        j += String(r.freq[i], 1);
+    }
+    j += "],\"z\":[";
+    for (int i = 0; i < r.count; i++) {
+        if (i) j += ",";
+        j += String(r.impedance[i], 1);
+    }
+    j += "],\"phase\":[";
+    for (int i = 0; i < r.count; i++) {
+        if (i) j += ",";
+        j += String(r.phase[i], 1);
+    }
+    j += "]}";
+    return j;
+}
+
+void handleScan() {
+    float a = server.arg("start").toFloat();
+    float b = server.arg("stop").toFloat();
+    float c = server.arg("step").toFloat();
+    if (a < 10) a = 10;
+    if (b > 20000) b = 20000;
+    if (c < 1) c = 1;
+
+    currentMode = MODE_SCANNING;
+    performScan(scanResult, a, b, c);
+    currentMode = MODE_IDLE;
+
+    server.send(200, "application/json", buildJSON(scanResult));
+}
+
+void handleSelfScan() {
+    float a = server.arg("start").toFloat();
+    float b = server.arg("stop").toFloat();
+    float c = server.arg("step").toFloat();
+    if (a < 100) a = 100;
+    if (b > 20000) b = 20000;
+    if (c < 10) c = 10;
+
+    currentMode = MODE_SELF_SCAN;
+    performScan(selfScanResult, a, b, c);
+    currentMode = MODE_IDLE;
+
+    server.send(200, "application/json",
+                buildJSON(selfScanResult));
+}
+
+void handleGenerate() {
+    float freq = server.arg("freq").toFloat();
+    bool useMod = server.arg("mod") == "1";
+    float carrier = server.arg("carrier").toFloat();
+    float depth = server.arg("depth").toFloat();
+    if (freq < 1) freq = 1;
+
+    genParams.targetFreq = freq;
+    genParams.useModulation = useMod;
+    genParams.carrierFreq = carrier;
+    genParams.modulationDepth = depth;
+
+    stopSynth();
+    delay(10);
+
+    if (useMod && carrier > freq) {
+        startModulatedSynth(carrier, freq, depth);
+        currentMode = MODE_MODULATED;
+    } else {
+        startSynth(freq);
+        currentMode = MODE_GENERATING;
+    }
+    server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleAdaptive() {
+    float freq = server.arg("freq").toFloat();
+    float window = server.arg("window").toFloat();
+    float step = server.arg("step").toFloat();
+    float interval = server.arg("interval").toFloat();
+    bool useMod = server.arg("mod") == "1";
+    float carrier = server.arg("carrier").toFloat();
+    float depth = server.arg("depth").toFloat();
+
+    adaptiveState.currentFreq = freq;
+    adaptiveState.scanWindow = window;
+    adaptiveState.adaptStep = step;
+    adaptiveState.scanIntervalMs = (unsigned long)(interval * 1000);
+    adaptiveState.lastScanMs = millis();
+
+    genParams.useModulation = useMod;
+    genParams.carrierFreq = carrier;
+    genParams.modulationDepth = depth;
+
+    stopSynth();
+    delay(10);
+
+    if (useMod && carrier > freq) {
+        startModulatedSynth(carrier, freq, depth);
+    } else {
+        startSynth(freq);
+    }
+    currentMode = MODE_ADAPTIVE;
+
+    server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleStop() {
+    stopSynth();
+    currentMode = MODE_IDLE;
+    server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleStatus() {
+    String j = "{\"mode\":\"";
+    switch (currentMode) {
+        case MODE_IDLE:       j += "idle"; break;
+        case MODE_SCANNING:   j += "scanning"; break;
+        case MODE_GENERATING: j += "generating"; break;
+        case MODE_ADAPTIVE:   j += "adaptive"; break;
+        case MODE_SELF_SCAN:  j += "selfscan"; break;
+        case MODE_MODULATED:  j += "modulated"; break;
+    }
+    j += "\",\"currentFreq\":";
+    j += String(adaptiveState.currentFreq, 1);
+    j += "}";
+    server.send(200, "application/json", j);
+}
+
+// ═══════════════════════════════════════
+// SETUP — только WiFi, ничего лишнего!
+// ═══════════════════════════════════════
+
+void setup() {
+    Serial.begin(115200);
+    delay(500);
+
+    Serial.println("\n=== EMI Resonance Scanner v2 ===");
+
+    #ifdef CORE3
+    Serial.println("Core 3.x");
+    #else
+    Serial.println("Core 2.x");
+    #endif
+
+    Serial.println(ESP.getChipModel());
+    Serial.printf("Cores: %d, Heap: %d\n",
+                   ESP.getChipCores(), ESP.getFreeHeap());
+
+    // Таблица синуса (быстро, не мешает)
+    initSineTable();
+
+    // АЦП — только настройка, не запуск
+    analogReadResolution(12);
+    analogSetAttenuation(ADC_11db);
+
+    // ═══ WiFi — СНАЧАЛА, без нагрузки ═══
+    WiFi.mode(WIFI_AP);
+    WiFi.setSleep(false);
+
+    bool apOK = WiFi.softAP(AP_SSID, AP_PASS, 1, 0, 4);
+    delay(100);
+    WiFi.softAPConfig(AP_IP, AP_GW, AP_MASK);
+
+    Serial.print("AP: ");
+    Serial.println(apOK ? "OK" : "FAIL");
+    delay(500);
+    Serial.print("IP: ");
+    Serial.println(WiFi.softAPIP());
+    Serial.print("MAC: ");
+    Serial.println(WiFi.softAPmacAddress());
+
+    // DNS Captive Portal
+    dnsServer.start(53, "*", AP_IP);
+
+    // HTTP
+    server.on("/", handleRoot);
+    server.on("/api/scan", handleScan);
+    server.on("/api/selfscan", handleSelfScan);
+    server.on("/api/generate", handleGenerate);
+    server.on("/api/adaptive", handleAdaptive);
+    server.on("/api/stop", handleStop);
+    server.on("/api/status", handleStatus);
+
+    server.on("/generate_204", handleRedirect);
+    server.on("/fwlink", handleRedirect);
+    server.on("/hotspot-detect.html", handleRedirect);
+    server.on("/canonical.html", handleRedirect);
+    server.on("/connecttest.txt", handleRedirect);
+    server.on("/redirect", handleRedirect);
+    server.on("/success.txt", []() {
+        server.send(200, "text/plain", "success");
+    });
+    server.onNotFound(handleRedirect);
+
+    server.begin();
+    Serial.println("Ready. Connect to: " + String(AP_SSID));
+
+    // ТАЙМЕР НЕ ЗАПУСКАЕТСЯ!
+    // Он запустится при первом нажатии кнопки в браузере
+}
+
+// ═══════════════════════════════════════
+// LOOP — минимальная нагрузка
+// ═══════════════════════════════════════
+
+void loop() {
+    dnsServer.processNextRequest();
+    server.handleClient();
+
+    // Адаптивный режим
+    if (currentMode == MODE_ADAPTIVE) {
+        unsigned long now = millis();
+        if (now - adaptiveState.lastScanMs
+            >= adaptiveState.scanIntervalMs) {
+            adaptiveState.lastScanMs = now;
+
+            stopSynth();
+            delay(20);
+
+            float newFreq = adaptiveMiniScan(
+                adaptiveState.currentFreq,
+                adaptiveState.scanWindow,
+                adaptiveState.adaptStep
+            );
+
+            Serial.printf("Adapt: %.1f -> %.1f Hz\n",
+                           adaptiveState.currentFreq, newFreq);
+            adaptiveState.currentFreq = newFreq;
+
+            if (genParams.useModulation
+                && genParams.carrierFreq > newFreq) {
+                startModulatedSynth(
+                    genParams.carrierFreq,
+                    newFreq,
+                    genParams.modulationDepth
+                );
+            } else {
+                startSynth(newFreq);
+            }
+        }
+    }
+
+    delay(1);
+}
